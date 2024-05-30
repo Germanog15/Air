@@ -1,0 +1,244 @@
+WITH date_series AS (
+    SELECT
+        DATE_TRUNC( 'day', CAST(day AS DATE) ) AS event_day
+    FROM
+        UNNEST(
+            sequence(
+                CAST('2021-09-23' AS DATE),
+                CURRENT_DATE,
+                INTERVAL '1' DAY
+            )
+        ) AS t(day)
+),
+profile AS (
+    SELECT
+        profile.fid,
+        profile.fname,
+        profile.display_name,
+        profile.avatar_url,
+        ROW_NUMBER() OVER (PARTITION BY profile.fid ORDER BY LENGTH(profile.verified_addresses) DESC NULLS LAST) AS rn
+    FROM dune.neynar.dataset_farcaster_profile_with_addresses profile
+),
+display_names AS (
+    SELECT
+        fid,
+        value AS display_name,
+        timestamp,
+        ROW_NUMBER() OVER (PARTITION BY fid ORDER BY timestamp DESC) AS rn
+    FROM
+        dune.neynar.dataset_farcaster_user_data
+    WHERE
+        type = 2
+),
+avatar_urls AS (
+    SELECT
+        fid,
+        value AS avatar_url,
+        timestamp,
+        ROW_NUMBER() OVER (PARTITION BY fid ORDER BY timestamp DESC) AS rn
+    FROM
+        dune.neynar.dataset_farcaster_user_data
+    WHERE
+        type = 1
+),
+users AS (
+    SELECT
+        fid,
+        MIN( DATE_TRUNC('day', timestamp) ) AS first_cast_timestamp
+    FROM
+        dune.neynar.dataset_farcaster_casts
+    WHERE
+        deleted_at IS NULL
+        AND parent_hash IS NULL
+    GROUP BY
+        fid
+    HAVING
+        COUNT(*) >= 3
+),
+daily_users AS (
+    SELECT
+        d.event_day,
+        u.fid,
+        u.first_cast_timestamp
+    FROM
+        date_series d
+    CROSS JOIN
+        users u
+    WHERE
+        d.event_day >= u.first_cast_timestamp
+),
+reactions AS (
+    SELECT
+        DATE_TRUNC('day', casts.timestamp) AS event_day,
+        rxn.target_fid AS fid,
+        COUNT(DISTINCT rxn.fid) AS reaction_count
+    FROM
+        dune.neynar.dataset_farcaster_casts casts
+    INNER JOIN
+        dune.neynar.dataset_farcaster_reactions rxn
+            ON rxn.target_hash = casts.hash
+            AND rxn.target_fid = casts.fid
+    WHERE
+        casts.deleted_at IS NULL
+        AND casts.parent_hash IS NULL
+        AND rxn.deleted_at IS NULL
+    GROUP BY
+        1,
+        rxn.target_fid
+),
+original_casts AS(
+    SELECT
+        DATE_TRUNC('day', timestamp) AS event_day,
+        fid,
+        COUNT(*) AS cast_count
+    FROM
+        dune.neynar.dataset_farcaster_casts
+    WHERE
+        deleted_at IS NULL
+        AND parent_hash IS NULL
+    GROUP BY
+        1,
+        fid
+),
+daily_stats AS (
+    SELECT
+        u.event_day,
+        u.fid,
+        u.first_cast_timestamp,
+        SUM( COALESCE(og.cast_count, 0) ) OVER (
+            PARTITION BY u.fid
+            ORDER BY u.event_day ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        ) AS cast_count,
+        SUM( COALESCE(rxn.reaction_count, 0) ) OVER (
+            PARTITION BY u.fid
+         ORDER BY u.event_day ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        ) AS reaction_count,
+        APPROX_PERCENTILE( COALESCE(rxn.reaction_count, 1), 0.6 ) OVER (
+            PARTITION BY u.fid
+            ORDER BY u.event_day ROWS BETWEEN 7 PRECEDING AND CURRENT ROW
+        ) AS median_reactions_60,
+        APPROX_PERCENTILE( COALESCE(rxn.reaction_count, 1), 0.5 ) OVER (
+            PARTITION BY u.fid
+            ORDER BY u.event_day ROWS BETWEEN 7 PRECEDING AND CURRENT ROW
+        ) AS median_reactions_50,
+        APPROX_PERCENTILE( COALESCE(rxn.reaction_count, 1), 0.4 ) OVER (
+            PARTITION BY u.fid
+            ORDER BY u.event_day ROWS BETWEEN 7 PRECEDING AND CURRENT ROW
+        ) AS median_reactions_40,
+        APPROX_PERCENTILE( COALESCE(rxn.reaction_count, 1), 0.3 ) OVER (
+            PARTITION BY u.fid
+            ORDER BY u.event_day ROWS BETWEEN 7 PRECEDING AND CURRENT ROW
+        ) AS median_reactions_30,
+        APPROX_PERCENTILE( COALESCE(rxn.reaction_count, 1), 0.2 ) OVER (
+            PARTITION BY u.fid
+            ORDER BY u.event_day ROWS BETWEEN 7 PRECEDING AND CURRENT ROW
+        ) AS median_reactions_20
+    FROM
+        daily_users u
+    LEFT JOIN
+        reactions rxn
+            ON rxn.event_day = u.event_day
+            AND rxn.fid = u.fid
+    LEFT JOIN
+        original_casts og
+            ON og.event_day = u.event_day
+            AND og.fid = u.fid
+),
+final_stats AS (
+    SELECT
+        event_day,
+        fid,
+        first_cast_timestamp,
+        CASE
+            WHEN cast_count >= 1000 THEN median_reactions_60
+            WHEN cast_count >= 500  THEN median_reactions_50
+            WHEN cast_count >= 100  THEN median_reactions_40
+            WHEN cast_count >= 50   THEN median_reactions_30
+            ELSE median_reactions_20
+        END AS median_reactions,
+        CASE
+            WHEN cast_count <> 0 THEN reaction_count / cast_count
+            ELSE 0
+        END AS reactions_per_cast
+    FROM
+        daily_stats
+    WHERE
+        event_day >= CAST('2024-04-20' AS DATE)
+        AND event_day < CURRENT_DATE
+),
+allowance AS (
+    SELECT
+        stats.event_day,
+        stats.fid,
+        stats.first_cast_timestamp,
+        stats.median_reactions,
+        stats.reactions_per_cast,
+        COALESCE(ovrrd.address, verified_eth_addresses.address) AS wallet_address,
+        profile.fname,
+        profile.display_name,
+        profile.avatar_url,
+        ROUND(LOG10( date_diff('day', stats.first_cast_timestamp, stats.event_day) + 10 ), 0) AS retroactive_boost,
+        ROUND(
+            EXP(LOG( 3, stats.median_reactions * 100))
+            * ROUND(LOG10( date_diff('day', stats.first_cast_timestamp, stats.event_day) + 10 ), 0)
+        , 0) AS tip_allowance
+    FROM
+        final_stats stats
+    LEFT JOIN
+        profile
+            ON profile.fid = stats.fid
+            AND profile.rn = 1
+    LEFT JOIN
+        query_3464901 verified_eth_addresses
+            ON verified_eth_addresses.fid = stats.fid
+            AND verified_eth_addresses.rn = 1
+    LEFT JOIN
+        query_3423915 ovrrd
+            ON ovrrd.fid = stats.fid
+    WHERE
+        verified_eth_addresses.address IS NOT NULL
+)
+SELECT
+    ROW_NUMBER() OVER (
+        PARTITION BY a.event_day
+        ORDER BY a.tip_allowance DESC, a.first_cast_timestamp
+    ) AS user_rank,
+    a.event_day + INTERVAL '1' DAY AS snapshot_date,
+    a.fid,
+    ROUND(a.tip_allowance / SUM(a.tip_allowance) OVER (PARTITION BY a.event_day) * 5000000, 0) AS tip_allowance,
+    COALESCE(airdrop_2_leaderboard.points, 0) AS points,
+    a.median_reactions,
+    a.reactions_per_cast,
+    a.retroactive_boost,
+    a.wallet_address,
+    a.fname,
+    dis.display_name,
+    ava.avatar_url
+FROM
+    allowance a
+INNER JOIN
+    query_3471566 degen_holders
+        ON degen_holders.fid = a.fid
+LEFT JOIN
+    display_names dis
+        ON dis.fid = a.fid
+        AND dis.rn = 1
+LEFT JOIN
+    avatar_urls ava
+        ON ava.fid = a.fid
+        AND ava.rn = 1
+LEFT JOIN
+    query_3444616 disqualified
+        ON disqualified.fid = a.fid
+LEFT JOIN
+    query_3416324 airdrop_2_leaderboard
+        ON airdrop_2_leaderboard.fid = a.fid
+WHERE
+    a.tip_allowance <> 0
+    AND disqualified.fid IS NULL
+ORDER BY 
+    a.event_day DESC,
+    4 DESC
+;
+
+    
